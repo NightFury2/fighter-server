@@ -1,11 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"image"
-	"image/color"
+	"log"
 	"net"
-	"path/filepath"
 
 	"gocv.io/x/gocv"
 )
@@ -17,12 +17,12 @@ var (
 	pose    [][]image.Point
 
 	deviceID = 0
-	proto    = "./assets/deploy.prototxt"
-	model    = "./assets/res10_300x300_ssd_iter_140000.caffemodel"
+	proto    = "./assets/openpose_pose_coco.prototxt"
+	model    = "./assets/pose_iter_440000.caffemodel"
 	backend  = gocv.NetBackendDefault
 	target   = gocv.NetTargetCPU
 
-	addr     = ":8081"
+	addr     = ":8080"
 	protocol = "udp"
 )
 
@@ -43,9 +43,6 @@ func main() {
 
 	fmt.Println("Reading " + protocol + " from " + udpAddr.String())
 
-	img := gocv.NewMat()
-	defer img.Close()
-
 	n := gocv.ReadNet(model, proto)
 	gocvNet = &n
 	if gocvNet.Empty() {
@@ -57,20 +54,6 @@ func main() {
 	gocvNet.SetPreferableBackend(gocv.NetBackendType(backend))
 	gocvNet.SetPreferableTarget(gocv.NetTargetType(target))
 
-	var ratio float64
-	var mean gocv.Scalar
-	var swapRGB bool
-
-	if filepath.Ext(model) == ".caffemodel" {
-		ratio = 1.0
-		mean = gocv.NewScalar(104, 177, 123, 0)
-		swapRGB = false
-	} else {
-		ratio = 1.0 / 127.5
-		mean = gocv.NewScalar(127.5, 127.5, 127.5, 0)
-		swapRGB = true
-	}
-
 	udpReqCount := 0
 	for {
 		buf := make([]byte, 500000)
@@ -81,20 +64,23 @@ func main() {
 			return
 		}
 		udpReqCount++
+		fmt.Println("Received", " count ", udpReqCount, " buff size ", len, " connection ", remoteAddr.String(), " message ", string(buf[0:5]))
 
-		// TODO implement pose detection
-		img2, err := gocv.NewMatFromBytes(img.Rows(), img.Cols(), img.Type(), buf)
+		frame, err := gocv.IMDecode(buf, gocv.IMReadColor)
 		if err != nil {
 			fmt.Println("Error parse buff to img ", err)
 			continue
 		}
 
-		// convert image Mat DataType to CV_32F
-		imgCV32F := img2.Clone()
-		imgCV32F.ConvertTo(&imgCV32F, gocv.MatTypeCV32F)
+		if frame.Empty() {
+			fmt.Println("Image is empty")
+			continue
+		}
 
-		// convert image Mat to 300x300 blob that the object detector can analyze
-		blob := gocv.BlobFromImage(imgCV32F, ratio, image.Pt(300, 300), mean, swapRGB, false)
+		blob := gocv.BlobFromImage(frame, 1.0, image.Pt(224, 224), gocv.NewScalar(0, 0, 0, 0), false, false)
+		if blob.Empty() {
+			fmt.Println("Invalid blob in Caffe test")
+		}
 
 		// feed the blob into the detector
 		gocvNet.SetInput(blob, "")
@@ -102,32 +88,108 @@ func main() {
 		// run a forward pass thru the network
 		prob := gocvNet.Forward("")
 
-		performDetection(&img, prob)
+		var midx int
+		s := prob.Size()
+		nparts, h, w := s[1], s[2], s[3]
 
+		// find out, which model we have
+		switch nparts {
+		case 19:
+			// COCO body
+			midx = 0
+			nparts = 18 // skip background
+		case 16:
+			// MPI body
+			midx = 1
+			nparts = 15 // skip background
+		case 22:
+			// hand
+			midx = 2
+		default:
+			fmt.Println("there should be 19 parts for the COCO model, 16 for MPI, or 22 for the hand model")
+			return
+		}
+
+		// find the most likely match for each part
+		pts := make([]image.Point, 22)
+		for i := 0; i < nparts; i++ {
+			pts[i] = image.Pt(-1, -1)
+			heatmap, _ := prob.FromPtr(h, w, gocv.MatTypeCV32F, 0, i)
+
+			_, maxVal, _, maxLoc := gocv.MinMaxLoc(heatmap)
+			if maxVal > 0.1 {
+				pts[i] = maxLoc
+			}
+			heatmap.Close()
+		}
+
+		// determine scale factor
+		sX := int(float32(frame.Cols()) / float32(w))
+		sY := int(float32(frame.Rows()) / float32(h))
+
+		// create the results array of pairs of points with the lines that best fit
+		// each body part, e.g.
+		// [[point A for body part 1, point B for body part 1],
+		//  [point A for body part 2, point B for body part 2], ...]
+		results := [][]image.Point{}
+		for _, p := range PosePairs[midx] {
+			a := pts[p[0]]
+			b := pts[p[1]]
+
+			// high enough confidence in this pose?
+			if a.X <= 0 || a.Y <= 0 || b.X <= 0 || b.Y <= 0 {
+				continue
+			}
+
+			// scale to image size
+			a.X *= sX
+			a.Y *= sY
+			b.X *= sX
+			b.Y *= sY
+
+			results = append(results, []image.Point{a, b})
+		}
 		prob.Close()
 		blob.Close()
+		frame.Close()
 
-		// fmt.Println(results)
+		var jsonData []byte
+		fmt.Println(results)
 
-		udpConn.WriteToUDP(buf, remoteAddr)
-		fmt.Println("Received", " count ", udpReqCount, " buff size ", len, " connection ", remoteAddr.String(), " message ", string(buf[0:20]))
-	}
-}
-
-// performDetection analyzes the results from the detector network,
-// which produces an output blob with a shape 1x1xNx7
-// where N is the number of detections, and each detection
-// is a vector of float values
-// [batchId, classId, confidence, left, top, right, bottom]
-func performDetection(frame *gocv.Mat, results gocv.Mat) {
-	for i := 0; i < results.Total(); i += 7 {
-		confidence := results.GetFloatAt(0, i+2)
-		if confidence > 0.5 {
-			left := int(results.GetFloatAt(0, i+3) * float32(frame.Cols()))
-			top := int(results.GetFloatAt(0, i+4) * float32(frame.Rows()))
-			right := int(results.GetFloatAt(0, i+5) * float32(frame.Cols()))
-			bottom := int(results.GetFloatAt(0, i+6) * float32(frame.Rows()))
-			gocv.Rectangle(frame, image.Rect(left, top, right, bottom), color.RGBA{0, 255, 0, 0}, 2)
+		jsonData, err = json.Marshal(results)
+		if err != nil {
+			log.Println(err)
 		}
+
+		fmt.Println(jsonData)
+
+		udpConn.WriteToUDP(jsonData, remoteAddr)
 	}
 }
+
+// PosePairs is a table of the body part connections in the format [model_id][pair_id][from/to]
+// For details please see:
+// https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/doc/output.md
+//
+var PosePairs = [3][20][2]int{
+	{ // COCO body
+		{1, 2}, {1, 5}, {2, 3},
+		{3, 4}, {5, 6}, {6, 7},
+		{1, 8}, {8, 9}, {9, 10},
+		{1, 11}, {11, 12}, {12, 13},
+		{1, 0}, {0, 14},
+		{14, 16}, {0, 15}, {15, 17},
+	},
+	{ // MPI body
+		{0, 1}, {1, 2}, {2, 3},
+		{3, 4}, {1, 5}, {5, 6},
+		{6, 7}, {1, 14}, {14, 8}, {8, 9},
+		{9, 10}, {14, 11}, {11, 12}, {12, 13},
+	},
+	{ // hand
+		{0, 1}, {1, 2}, {2, 3}, {3, 4}, // thumb
+		{0, 5}, {5, 6}, {6, 7}, {7, 8}, // pinkie
+		{0, 9}, {9, 10}, {10, 11}, {11, 12}, // middle
+		{0, 13}, {13, 14}, {14, 15}, {15, 16}, // ring
+		{0, 17}, {17, 18}, {18, 19}, {19, 20}, // small
+	}}

@@ -9,8 +9,7 @@ import (
 
 var (
 	deviceID = 0
-
-	addr     = ":8081"
+	addr     = ":8080"
 	protocol = "udp"
 )
 
@@ -50,9 +49,11 @@ func main() {
 			continue
 		}
 
+		fmt.Println("Buff size ", len(img.ToBytes()))
+
 		_, err := udpConn.Write(img.ToBytes()[0:22000])
 		if err != nil {
-			fmt.Printf("Error write: ", err)
+			fmt.Println("Error write: ", err)
 			return
 		}
 	}
